@@ -7,7 +7,10 @@
     "test": "test"
   },
   "dependencies": {
+    "@openzeppelin/contracts": "^4.8.2",
     "cors": "^2.8.5",
+    "ethereumjs-tx": "^2.1.2",
+    "ethereumjs-util": "^7.1.5",
     "web3": "^1.9.0"
   },
   "devDependencies": {},
