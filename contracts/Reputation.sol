@@ -57,9 +57,11 @@ contract Reputation is ERC20, Ownable {
     uint256 public authorityCount;
     uint256 public candidateCount;
     address public currentPrimary;
-    uint256 public authorityThreshold = 1000;
+    uint256 public AUTHORITY_THRESHOLD = 1000;
     uint256 public primaryIndex = 0;
-    uint256 public blockReward = 100;
+    uint256 public BLOCK_REWARD = 100;
+    uint256 public PENALTY = 25;
+    uint256 public MIN_TRANSACTION_RATIO = 2;
 
     event NodeAdded(address nodeAddress, bool isAuthority, bool isFullNode);
     event NodeRemoved(address nodeAddress);
@@ -67,6 +69,7 @@ contract Reputation is ERC20, Ownable {
     event NodeDemoted(address nodeAddress);
     event ReputationAdded(address authorityNode, address nodeAddress, uint256 points);
     event ReputationRemoved(address authorityNode, address nodeAddress, uint256 points);
+    event PrimaryChanged(address primaryNode);
 
     modifier onlyAuthorityNode() {
         require(nodes[msg.sender].isAuthority, "Only an authority node can call this function");
@@ -76,14 +79,13 @@ contract Reputation is ERC20, Ownable {
     function addNode(bool _isAuthority, bool _isFullNode) public {
         Node storage node = nodes[msg.sender];
         require(node.reputation == 0, "Node already added");
-        
         node.isAuthority = _isAuthority;
         node.isFullNode = _isFullNode;
         node.reputation = 0;
         if (_isAuthority) {
             authorityNodes.push(msg.sender);
             node.authorityIndex = authorityNodes.length - 1;
-            node.reputation = authorityThreshold;
+            node.reputation = AUTHORITY_THRESHOLD;
             authorityCount++;
         } else {
             candidateCount++;
@@ -148,7 +150,7 @@ contract Reputation is ERC20, Ownable {
         Node storage node = nodes[nodeAddress];
         node.reputation += points;
         emit ReputationAdded(msg.sender, nodeAddress, points);
-        if(node.reputation > authorityThreshold)
+        if(node.reputation > AUTHORITY_THRESHOLD)
         {
             promoteNode(nodeAddress);
         }
@@ -166,8 +168,9 @@ contract Reputation is ERC20, Ownable {
         {
             node.reputation -= points;
         }
-        if (node.isAuthority && node.reputation < authorityThreshold)
+        if (node.isAuthority && node.reputation < AUTHORITY_THRESHOLD)
         {
+                consensusState=IN_CONSENSUS;
             demoteNode(nodeAddress);
         }
             emit ReputationRemoved(msg.sender, nodeAddress, points);
@@ -177,14 +180,20 @@ contract Reputation is ERC20, Ownable {
     {
         Node storage node = nodes[currentPrimary];
         require(node.isAuthority, "Primary node must be an authority");
-        node.reputation += blockReward;
+        node.reputation += BLOCK_REWARD;
+    }
+    function penalisePrimary() public onlyAuthorityNode
+    {
+        Node storage node = nodes[currentPrimary];
+        require(node.isAuthority, "Primary node must be an authority");
+        node.reputation -= PENALTY;
     }
 
     function getNextPrimary() public
     {
         primaryIndex = (primaryIndex + 1) % authorityNodes.length;
         currentPrimary = authorityNodes[primaryIndex];
-        rewardPrimary();
+        emit PrimaryChanged(currentPrimary);
     }
     
 
@@ -217,11 +226,19 @@ contract Reputation is ERC20, Ownable {
         return lastBlock.index+1;
     }
 
-    //authority nodes call VerifyBlock() in Javascript. Wait ten seconds? and call getNumVotes() to see if the block was verified.
+    //authority nodes call VerifyBlock() in Javascript.
+    //Wait ten seconds? and call getNumVotes() to see if the block was verified.
+    
+    uint32 private consensusState=SLEEP;
+    uint32 IN_CONSENSUS=0;
+    uint32 SLEEP=1;
+    Block selectedBlock;
+
     function appendBlock(bytes32 data) public onlyAuthorityNode
     {
-        //require(!blockExists[keccak256(abi.encodePacked(getChainLength(), data, getLatestBlock().hash))], "Block already exists");
         require(msg.sender == currentPrimary, "Only primary node can add a block");
+        require(consensusState == SLEEP,
+        "Another consensus is underway. Try again later"); //implement a queue?
 
         Block memory previousBlock = getLatestBlock();
 
@@ -235,45 +252,89 @@ contract Reputation is ERC20, Ownable {
         blockExists[newBlock.hash] = true;
         blockHashes[newBlock.index] = newBlock.hash;
         emit BlockAdded(msg.sender, newBlock.index, newBlock.hash, newBlock.data);
+
+        selectedBlock=newBlock;
+        consensusState=IN_CONSENSUS;
     }
 
     //implement Javascript logic to listen for a block being added and verify it
-    function verifyBlock(bytes32 data, bytes32 hash) public returns (bool exists)
+    function verifyBlock(bytes32 data, bytes32 hash) public view returns (bool exists)
     {
         if(blockExists[keccak256(abi.encodePacked(getChainLength(), data, hash))])
         {
-            lastBlock = getBlockByHash(hash);
             return true;
         }
     }
 
-    function recoverSigner(bytes32 messageHash, uint8 v, bytes32 r, bytes32 s) public pure returns (address)
-    {
-        bytes32 prefixedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
-        return ecrecover(prefixedHash, v, r, s);
-    }
+    mapping (address => bool) public hasVoted;
+    uint public yesVotes;
+    uint public noVotes;
+    mapping (address => bool) public hasVotedYes;
 
+    uint32 CONSENSUS_NOT_REACHED=0;
+    uint32 MAJORITY_YES=1;
+    uint32 MAJORITY_NO=2;
+
+    function vote(bool voteYes) public onlyAuthorityNode {
+        require(hasVoted[msg.sender] == false, "Already voted.");
+        hasVoted[msg.sender] = true;
+
+        if (voteYes) {
+            yesVotes += 1;
+            hasVotedYes[msg.sender] = true;
+        } else {
+            noVotes += 1;
+        }
+        uint32 consenus = peekVotes();
+        if(consenus==CONSENSUS_NOT_REACHED){
+            return;
+        }
+        else{
+            if(consenus==MAJORITY_YES){
+                lastBlock = selectedBlock;
+                rewardPrimary();
+                getNextPrimary();
+                //new transaction
+                consensusState=SLEEP;
+            }
+            else if(consenus==MAJORITY_NO){
+                penalisePrimary();
+                getNextPrimary();
+                //same transaction
+            }
+            else{
+                revert("Invalid Consensus conclusion");
+            }
+            resetVotes();
+        }
+    }
     
-    function getNumAdminVotes(bytes32 _transactionHash) public view returns (uint256) {
-        uint256 numVotes = 0;
-        for (uint256 i = 0; i < authorityCount ; i++) {
-            address authAddress = authorityNodes[i];
-            Node memory verifier = nodes[authAddress];
-            if (verifier.isAuthority) {
-                bytes32 message = keccak256(abi.encodePacked(_transactionHash, authAddress));
-                bytes32 prefixedMessage = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", message));
-                address recoveredAddress = ecrecover(prefixedMessage, 27, bytes32(0), bytes32(0));
-                if (recoveredAddress == authAddress) {
-                    numVotes++;
-                }
+    function peekVotes() public view returns (uint32){
+        if(yesVotes + noVotes < MIN_TRANSACTION_RATIO/authorityCount){
+            return CONSENSUS_NOT_REACHED;
+        }
+        else{
+            if (hasMajority()) {
+                return MAJORITY_YES;
+            }
+            else{
+                return MAJORITY_NO;
             }
         }
-        return numVotes;
+    }
+    function hasMajority() public view returns (bool) {
+        return ((yesVotes + noVotes) < MIN_TRANSACTION_RATIO/authorityCount) && (yesVotes >= noVotes);
     }
 
-    function getMajorityVote(uint256 _numVotes) public view returns (bool) {
-        return (_numVotes * 2 > authorityCount);
+    function resetVotes() public onlyAuthorityNode {
+        require(yesVotes + noVotes > MIN_TRANSACTION_RATIO/authorityCount,
+        "The minimum required number of authority nodes has not voted yet.");
+        for (uint i = 0; i < authorityNodes.length; i++) {
+            hasVoted[authorityNodes[i]] = false;
+            hasVotedYes[authorityNodes[i]] = false;
+        }
+        yesVotes = 0;
+        noVotes = 0;
     }
         
-
 }
